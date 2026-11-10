@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
-use crate::hub::Hub;
-use crate::ApiHandler;
+use crate::hub::{Hub, WsRoute};
+use crate::{ApiHandler, RawHandler};
 
 /// What a build operated on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +60,24 @@ pub struct State {
     pub last_error: Mutex<Option<String>>,
     /// App-registered JSON routes (`GET` only), installed once at startup.
     pub api: Arc<HashMap<String, ApiHandler>>,
+    /// Websocket channels by path. `/__m_hmr` is in here too — the HMR socket is
+    /// one route among them, not a special case in the request path.
+    ///
+    /// A `Mutex<HashMap>` rather than part of `State::new`'s arguments so an app
+    /// can register channels without changing how every existing caller builds a
+    /// `State`.
+    pub ws: Mutex<HashMap<String, Arc<WsRoute>>>,
+    /// Raw, prefix-matched routes: handlers that own the socket and may stream.
+    ///
+    /// Kept separate from `api` rather than folded into it. An `ApiHandler` is
+    /// `-> Response`, i.e. a whole JSON document, and every existing handler
+    /// depends on that. A streaming proxy has a different shape and a different
+    /// failure mode, and pretending the two are one type buys a `Response` that
+    /// cannot represent a stream.
+    ///
+    /// Sorted longest-prefix-first on insert so dispatch does not depend on the
+    /// order the app happened to register them in.
+    pub raw: Mutex<Vec<(String, Arc<RawHandler>)>>,
 }
 
 impl State {
@@ -83,7 +101,76 @@ impl State {
             activity: Mutex::new(None),
             last_error: Mutex::new(None),
             api: Arc::new(api),
+            ws: Mutex::new(HashMap::new()),
+            raw: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Register (or replace) a raw route under `prefix`.
+    pub fn add_raw(&self, prefix: &str, handler: RawHandler) {
+        let mut raw = self.raw.lock().unwrap();
+        raw.retain(|(p, _)| p != prefix);
+        raw.push((prefix.to_string(), Arc::new(handler)));
+        raw.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    }
+
+    /// The raw route that serves `path`, if any. Longest matching prefix wins.
+    pub fn raw_handler(&self, path: &str) -> Option<Arc<RawHandler>> {
+        self.raw
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(prefix, _)| path.starts_with(prefix))
+            .map(|(_, h)| Arc::clone(h))
+    }
+
+    /// Register (or replace) a websocket channel. Apps should go through
+    /// [`Server::ws`](crate::Server::ws) instead; this exists so `run()` can
+    /// install the dev server's own HMR route the same way.
+    pub fn add_ws(&self, path: &str, route: Arc<WsRoute>) {
+        self.ws
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(path.to_string(), route);
+    }
+
+    pub fn ws_route(&self, path: &str) -> Option<Arc<WsRoute>> {
+        self.ws
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(path)
+            .cloned()
+    }
+
+    /// Push one JSON message to every client of `path`, returning how many there
+    /// were. Non-blocking: a stalled client queues its own messages and never
+    /// holds up the caller — which matters for a 1 Hz feed with a laptop tab on a
+    /// bad connection.
+    pub fn ws_broadcast(&self, path: &str, msg: &serde_json::Value) -> usize {
+        match self.ws_route(path) {
+            Some(r) => {
+                r.hub.broadcast(&msg.to_string());
+                r.hub.count()
+            }
+            None => 0,
+        }
+    }
+
+    pub fn ws_clients(&self, path: &str) -> usize {
+        self.ws_route(path).map(|r| r.hub.count()).unwrap_or(0)
+    }
+
+    /// Paths with a live websocket channel, for the boot line and `/api/status`.
+    pub fn ws_paths(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .ws
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        v.sort();
+        v
     }
 
     pub fn next_seq(&self) -> u64 {

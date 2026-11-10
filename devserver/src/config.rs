@@ -46,6 +46,19 @@ pub struct ServerSide {
 pub struct Config {
     pub name: String,
     pub port: u16,
+    /// Interface to bind. **Defaults to loopback**, which is a security property,
+    /// not a convenience: the dev server is the whole backend for these apps, and
+    /// an app that has not thought about authorization should not be reachable
+    /// from the network by default.
+    ///
+    /// The one legitimate reason to widen it is the container case. Inside a
+    /// container the app must answer the *docker bridge*, so `127.0.0.1` will not
+    /// do — but that is only safe when the published mapping is itself loopback
+    /// (`-p 127.0.0.1:PORT:PORT`), so the host-facing socket stays on the host's
+    /// loopback and a reverse proxy on that host remains the only way in. Binding
+    /// here without narrowing the publish exports an unauthenticated control plane
+    /// to whatever can route to the host. The two settings are one decision.
+    pub host: std::net::Ipv4Addr,
     /// project root — the directory holding `rustex1.json`
     pub root: PathBuf,
     pub app: AppSide,
@@ -54,6 +67,18 @@ pub struct Config {
     pub statics: Vec<PathBuf>,
     /// directories watched for *static* changes (no rebuild, just a change msg)
     pub static_watch: Vec<PathBuf>,
+    /// Largest request body an `api` route will be handed, in bytes.
+    ///
+    /// Default is 1 MiB — right for a JSON API, far too small for anything that
+    /// accepts uploads. An app that proxies image or audio payloads sets
+    /// `"maxBodyBytes"` in `rustex1.json` to its own ceiling.
+    ///
+    /// Over the limit the server answers **413** rather than handing the handler
+    /// a body that has been quietly cut off mid-document. Truncating is the worse
+    /// failure: the JSON no longer parses, or worse, parses as something shorter
+    /// than what was sent, and every symptom downstream points at the handler
+    /// instead of at a transport limit.
+    pub max_body_bytes: usize,
 }
 
 impl Config {
@@ -112,6 +137,14 @@ impl Config {
             }
         };
 
+        // A bad `host` is ignored rather than fatal, mirroring how `port` is read:
+        // a typo in a config file should not stop a dev server from starting, and
+        // the fallback is the safe value.
+        let host = lookup(j, &["host"])
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
+
         let name = s(&["name"], "rustex1");
         let app_package = s(&["app", "package"], &format!("{name}-app"));
         let app_lib = s(&["app", "lib"], &app_package.replace('-', "_"));
@@ -138,6 +171,7 @@ impl Config {
         Config {
             name,
             port: n(&["port"], 3000),
+            host,
             root: root.to_path_buf(),
             app: AppSide {
                 package: app_package,
@@ -151,6 +185,14 @@ impl Config {
             },
             statics,
             static_watch,
+            // Bytes, not the u16 helper the other numeric knobs use — a body
+            // ceiling is comfortably larger than 65535 and `as_u64` would have
+            // silently truncated anything above a u16's range.
+            max_body_bytes: lookup(j, &["maxBodyBytes"])
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .filter(|v| *v > 0)
+                .unwrap_or(crate::http::DEFAULT_MAX_BODY),
         }
     }
 
