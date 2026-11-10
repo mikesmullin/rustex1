@@ -196,9 +196,44 @@ pub fn restart_server() {
     });
 }
 
+/// Whether the backend is a dev server.
+///
+/// `hot.mjs` publishes this from `GET /api/config` before the wasm is imported
+/// (`app.mjs` awaits `config()` first), so it is known by the time
+/// [`spawn_all`] runs.
+///
+/// Absent means **true**. A server that says nothing about `dev` is an older dev
+/// server — or any app that has not adopted the flag — and quietly deleting its
+/// status panel would be a regression the kit has no right to impose. Only an
+/// explicit `false` turns the telemetry off, so this is opt-in for the server
+/// and a no-op for everything already on the kit.
+fn dev_mode() -> bool {
+    let v = js::get(&js::window(), "__RUSTEX1_DEV__");
+    if js::is_missing(&v) {
+        return true;
+    }
+    v.is_truthy()
+}
+
 /// Initial pulls + the low-frequency poll. Structural churn stays cheap; the
 /// 60 fps work belongs in the app's own frame loop.
+///
+/// Both endpoints are *dev-server* routes: a production server has no build
+/// queue and no watcher, so the polling is pure traffic. It is worse than
+/// merely useless when those routes 404, because the failure lands in `fail()`,
+/// which writes `session.error` and `session.online = false` — a healthy
+/// deployed app rendering itself offline. `live.rs` derives the same chip from
+/// `window.__HMR__.connected`, so a client with no socket gets the identical red
+/// badge from the other direction.
+///
+/// A production server says so with `"dev": false` on `/api/config`, and both
+/// halves of that are then honoured here. See [`dev_mode`] for why the default
+/// keeps polling.
 pub fn spawn_all() {
+    if !dev_mode() {
+        js::log("[rustex1] dev telemetry disabled (server reports dev:false)");
+        return;
+    }
     fetch_status();
     fetch_builds();
     lifecycle::every(2000.0, fetch_status);

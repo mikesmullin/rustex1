@@ -36,7 +36,16 @@ export function config() {
   if (!configPromise) {
     configPromise = fetch('/api/config', { cache: 'no-store' })
       .then((r) => (r.ok ? r.json() : {}))
-      .then((json) => Object.assign(cfg, json || {}))
+      .then((json) => {
+        Object.assign(cfg, json || {})
+        // Publish the mode for the Rust side, which reads it in `spawn_all()`
+        // (kit/src/api.rs) to decide whether to poll the dev-server endpoints.
+        // `app.mjs` awaits this promise before importing the wasm, so the flag
+        // is always set before any Rust runs. Anything that never answers
+        // `dev` stays in dev mode, so existing apps are untouched.
+        window.__RUSTEX1_DEV__ = cfg.dev !== false
+        return cfg
+      })
       .catch(() => cfg)
   }
   return configPromise
@@ -333,7 +342,28 @@ function connect() {
 
 if (!window.__M_HMR_STARTED__) {
   window.__M_HMR_STARTED__ = true
-  config().then(connect) // know the artifact URLs before the first message lands
+  config().then((c) => {
+    // A production server has nothing to hot-replace, so do not open the socket
+    // at all. The distinction matters: `connect()`'s `close` handler reschedules
+    // itself unconditionally with backoff capped at 4 s, so an upgrade that is
+    // refused (or never answered) becomes a permanent retry loop — one TCP
+    // connect plus TLS handshake per tab, forever.
+    //
+    // `connected`/`phase` are then set by hand, because `live.rs` reads
+    // `__HMR__.connected` at 5 Hz to drive the status chip. Leaving it false
+    // would park a red OFFLINE badge on a pod whose /health says `ready: true`.
+    // `true` is the least-wrong of the two values the field admits: it drives a
+    // *liveness* indicator, and this app genuinely is live — it just has no
+    // build pipeline, which is what `phase: 'live'` and `building: false` say.
+    if (c.dev === false) {
+      stats.connected = true
+      stats.building = false
+      stats.phase = 'live'
+      document.documentElement.dataset.hmr = 'production'
+      return
+    }
+    connect()
+  }) // know the artifact URLs before the first message lands
 }
 
 export { connect, overlay, stats, flash }
