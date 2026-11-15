@@ -339,6 +339,9 @@ pub fn restart(state: &State) {
             return;
         }
     };
+    // Cargo replaces the running inode; Linux appends this marker to its path.
+    let exe = exe.to_string_lossy().strip_suffix(" (deleted)")
+        .map(std::path::PathBuf::from).unwrap_or(exe);
     state.broadcast(serde_json::json!({ "type": "restart", "target": "server" }));
     log("server", &format!("restarting → {}", exe.display()));
     std::thread::sleep(std::time::Duration::from_millis(150));
