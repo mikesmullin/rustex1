@@ -731,26 +731,56 @@ fn route(
         return out.finish();
     }
 
+    // Never SPA-fallback a machine path — and never 405 one either, which is why this
+    // sits above the method check rather than below it.
+    //
+    // 405 means "this resource exists and does not speak that verb". A path inside a
+    // declared machine namespace that matched no `api` route and no `raw` prefix has
+    // no resource at all, so 404 is the honest answer whatever the verb — and the 405
+    // below is really a statement about the *static handler* (it only serves GET/HEAD),
+    // which has no business being applied to a path it was never going to see.
+    //
+    // Getting this ordering wrong is the exact artifact the note above raw dispatch
+    // says motivated raw routes in the first place: an unimplemented
+    // `POST /:preset/v1/chat/completions` answered `405 method not allowed` from the
+    // framework, which reads as a broken client rather than a route that does not
+    // exist. Registering the presets fixed that for configured profiles; an unknown
+    // one was still falling through to 405, because the verbs that reach inference are
+    // POSTs and the guard below only ever ran for GET.
+    //
+    // [`State::json_only`] seeds `/api/*` — the case this rule was built for — and
+    // apps add namespaces the framework cannot enumerate.
+    if state.json_only_match(&req.path) {
+        // The registration hint is only true of the framework's own namespace. A
+        // gateway path is not registered with `Server::api()`, and sending someone to
+        // the wrong door is worse than sending them to no door.
+        let error = if req.path.starts_with("/api/") {
+            format!(
+                "no route for {} {} — register it with Server::api()",
+                req.method, req.path
+            )
+        } else {
+            format!("no route for {} {}", req.method, req.path)
+        };
+        return json_response(
+            stream,
+            404,
+            &serde_json::json!({
+                "ok": false,
+                "error": error,
+            }),
+            head_only,
+        );
+    }
+
+    // Only reached by paths heading for the static handler, which serves files and
+    // the SPA shell; neither is a thing you can POST to.
     if req.method != "GET" && req.method != "HEAD" {
         return respond(
             stream,
             405,
             "text/plain; charset=utf-8",
             b"method not allowed",
-            head_only,
-        );
-    }
-
-    // Never SPA-fallback an API path: a typo'd route otherwise comes back as
-    // 200 + index.html, which surfaces as a JSON parse error instead of a 404.
-    if req.path.starts_with("/api/") {
-        return json_response(
-            stream,
-            404,
-            &serde_json::json!({
-                "ok": false,
-                "error": format!("no route for {} {} — register it with Server::api()", req.method, req.path),
-            }),
             head_only,
         );
     }
@@ -937,6 +967,76 @@ mod tests {
     use crate::config::Config;
     use std::collections::HashMap;
     use std::net::TcpListener;
+    use crate::state::pattern_match;
+
+    /// The rule this guards: a machine path must 404 as JSON, and the SPA shell must
+    /// survive everywhere else. Every case below is a behaviour something real depends
+    /// on — the `/api` and static-path ones especially, because both were previously
+    /// produced by `starts_with("/api/")`, and a matcher that changed either would
+    /// break the dev server's own routes or the SPA's client-side routing.
+    #[test]
+    fn json_only_matches_machine_paths_only() {
+        // The seeded default: anything under /api/ with at least one segment after it.
+        assert!(pattern_match("/api/*", "/api/overview"));
+        assert!(pattern_match("/api/*", "/api/a/b"), "trailing * spans depth");
+        // A bare /api is not an API route — and was not under the old prefix test
+        // either. This is the equivalence lock, not a tautology: a matcher that made
+        // `/api` answer JSON would take a path away from the static handler that
+        // legitimately has an answer for it.
+        assert!(!pattern_match("/api/*", "/api"));
+        assert!(!pattern_match("/api/*", "/apis/overview"), "segment boundary kept");
+
+        // The gateway namespace: exactly one segment before the leaf, so a nested
+        // client route like /a/b/health stays the SPA's to answer.
+        assert!(pattern_match("/*/health", "/qwen3-8-flash-next-vllm-850k/health"));
+        assert!(!pattern_match("/*/health", "/health"), "no preset segment");
+        assert!(!pattern_match("/*/health", "/a/b/health"), "only one segment deep");
+        assert!(pattern_match("/*/v1/*", "/qwen/v1/chat/completions"));
+        assert!(pattern_match("/*/v1/*", "/qwen/v1/models"));
+        assert!(pattern_match("/*/v1", "/qwen/v1"));
+        assert!(!pattern_match("/*/v1/*", "/qwen/v1"), "bare /v1 is the other pattern");
+
+        // What the shell exists for. If any of these ever match, deep links in the
+        // browser start returning JSON 404s instead of the app.
+        for p in [
+            "/",
+            "/index.html",
+            "/css/styles.css",
+            "/css/kit-widgets.css",
+            "/pkg/mycloud_rs_app_bg.wasm",
+            "/app.mjs",
+            "/favicon.ico",
+            "/nodes",
+            "/usage",
+        ] {
+            assert!(
+                !pattern_match("/api/*", p)
+                    && !pattern_match("/*/health", p)
+                    && !pattern_match("/*/v1", p)
+                    && !pattern_match("/*/v1/*", p),
+                "static/SPA path {p} must fall through to index.html"
+            );
+        }
+    }
+
+    /// Registering is idempotent, and an app's patterns add to the default rather
+    /// than replacing it — losing `/api/*` would silently restore 200 + HTML for
+    /// every typo'd API route in every app that uses the kit.
+    #[test]
+    fn add_json_only_adds_and_dedupes() {
+        let s = state();
+        assert!(s.json_only_match("/api/anything"), "default survives");
+        assert!(!s.json_only_match("/nope/health"), "not until registered");
+        s.add_json_only("/*/health");
+        s.add_json_only("/*/health");
+        assert!(s.json_only_match("/qwen3-8/health"));
+        assert!(s.json_only_match("/api/anything"), "default still there");
+        assert_eq!(
+            s.json_only.lock().unwrap().len(),
+            2,
+            "re-registering a pattern must not grow the list"
+        );
+    }
 
     fn state() -> Arc<State> {
         let config = Config::discover(&std::env::current_dir().unwrap());
@@ -1077,6 +1177,61 @@ mod tests {
         );
         assert!(res.starts_with("HTTP/1.1 200"), "{res}");
         assert!(!res.contains("405"), "{res}");
+    }
+
+    /// The other half of the same bug, for a preset that is not configured at all:
+    /// no `raw` prefix matches, so the request used to reach the static handler and
+    /// be served `200 OK` + `index.html`. A health checker reads that as "up".
+    #[test]
+    fn an_unmatched_machine_path_is_json_404_not_the_shell() {
+        let st = state();
+        st.add_json_only("/*/health");
+        let port = serve_one(Arc::clone(&st));
+        let res = round_trip(port, b"GET /no-such-preset/health HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(res.starts_with("HTTP/1.1 404"), "{res}");
+        assert!(res.contains("application/json"), "must not be HTML: {res}");
+        assert!(!res.contains("<!DOCTYPE"), "served the SPA shell: {res}");
+        assert!(res.contains("no route for GET /no-such-preset/health"), "{res}");
+        // A gateway path is not an API route — do not tell people to register it
+        // with the wrong builder method.
+        assert!(!res.contains("Server::api()"), "misleading hint: {res}");
+    }
+
+    /// Ordering regression lock. The verbs that reach inference are POSTs, and the
+    /// guard originally sat below the framework's method gate — so this answered
+    /// `405 method not allowed` for a preset that does not exist, which is the same
+    /// framework artifact dressed up as a client bug that motivated raw routes. 405
+    /// claims the resource exists; here it does not.
+    #[test]
+    fn an_unmatched_machine_post_is_404_not_405() {
+        let st = state();
+        st.add_json_only("/*/v1/*");
+        let port = serve_one(Arc::clone(&st));
+        let res = round_trip(
+            port,
+            b"POST /no-such-preset/v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}",
+        );
+        assert!(res.starts_with("HTTP/1.1 404"), "expected 404, got: {res}");
+        assert!(!res.contains("405"), "method gate fired first: {res}");
+        assert!(res.contains("no route for POST"), "{res}");
+    }
+
+    /// Patterns only ever reject. A path that matches a pattern AND has a registered
+    /// raw route is served by that route — otherwise declaring the namespace would
+    /// 404 the gateway's own working endpoints, which is the failure mode that would
+    /// make someone delete this guard instead of fixing their typo.
+    #[test]
+    fn a_registered_raw_route_still_wins_over_a_matching_pattern() {
+        let st = state();
+        st.add_json_only("/*/v1/*");
+        echo_body_len(&st, "/preset/v1");
+        let port = serve_one(Arc::clone(&st));
+        let res = round_trip(
+            port,
+            b"POST /preset/v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}",
+        );
+        assert!(res.starts_with("HTTP/1.1 200"), "pattern shadowed the route: {res}");
+        assert!(!res.contains("404"), "{res}");
     }
 
     #[test]

@@ -78,6 +78,67 @@ pub struct State {
     /// Sorted longest-prefix-first on insert so dispatch does not depend on the
     /// order the app happened to register them in.
     pub raw: Mutex<Vec<(String, Arc<RawHandler>)>>,
+    /// Path patterns that must answer **JSON** even when nothing serves them.
+    ///
+    /// A request that matches no `api` route, no built-in and no `raw` prefix falls
+    /// through to the static handler, which serves `index.html` for any extensionless
+    /// path so the m-js Router can run in path mode. That is right for a browser
+    /// navigating to a client-side route and wrong for everything else: a typo'd
+    /// machine path comes back `200 OK` + HTML, which reads as healthy to a load
+    /// balancer and as a JSON parse error to an SDK.
+    ///
+    /// The `/api/` prefix is seeded by [`State::new`] — the case this mechanism was
+    /// built for, and the reason it lives here rather than as another `starts_with`
+    /// in the request path. Apps add their own with
+    /// [`Server::json_only`](crate::Server::json_only) when they own a namespace the
+    /// framework cannot enumerate: a gateway mounted at `/{preset}/v1/*` registers a
+    /// route per configured profile, so an unknown profile matches nothing and would
+    /// otherwise be served the SPA shell.
+    ///
+    /// A `Mutex<Vec<_>>` rather than a `State::new` argument, so registering these
+    /// does not change how every existing caller builds a `State`.
+    pub json_only: Mutex<Vec<String>>,
+}
+
+/// Match `path` against a [`State::json_only`] pattern, segment by segment.
+///
+/// `*` matches exactly one segment; a **trailing** `*` matches one or more, which is
+/// what makes `/api/*` cover both `/api/x` and `/api/x/y`. Deliberately this small:
+/// the only questions ever asked of these patterns are "is this the API namespace"
+/// and "is this the gateway namespace", and a general glob engine would be a bigger
+/// surface to get wrong than the handful of patterns that need matching.
+///
+/// Empty segments collapse, so `//api//x` matches `/api/*`. Harmless either way — no
+/// route is registered with an empty segment — but stated because collapsing is the
+/// kind of silence a matcher should not keep.
+pub fn pattern_match(pattern: &str, path: &str) -> bool {
+    // A nested fn rather than a closure: the closure's elided return lifetime cannot
+    // relate `Vec<&str>` back to its `&str` argument, and an annotation there would
+    // say less than this does.
+    fn seg(s: &str) -> Vec<&str> {
+        s.split('/').filter(|x| !x.is_empty()).collect()
+    }
+    let (p, x) = (seg(pattern), seg(path));
+    for (i, pat) in p.iter().enumerate() {
+        if *pat == "*" {
+            // Trailing: consume everything left, but not nothing. `/api` is not under
+            // `/api/`, and falling through to the static handler there is correct — a
+            // bare `/api` is not an API route either.
+            if i + 1 == p.len() {
+                return x.len() > i;
+            }
+            if i >= x.len() {
+                return false;
+            }
+            continue;
+        }
+        if i >= x.len() || x[i] != *pat {
+            return false;
+        }
+    }
+    // No trailing wildcard: the segment counts must agree exactly, so `/*/health`
+    // claims `/qwen3-8/health` and not `/qwen3-8/sub/health`.
+    p.len() == x.len()
 }
 
 impl State {
@@ -103,7 +164,27 @@ impl State {
             api: Arc::new(api),
             ws: Mutex::new(HashMap::new()),
             raw: Mutex::new(Vec::new()),
+            // The one rule the request path used to hardcode, now expressed through
+            // the same matcher everything else uses. `/api/*` covers any path under
+            // `/api/` with at least one segment after it — the exact set
+            // `path.starts_with("/api/")` selected, including NOT matching a bare
+            // `/api`, which the static handler serves as before.
+            json_only: Mutex::new(vec!["/api/*".to_string()]),
         }
+    }
+
+    /// Register (or replace) a no-SPA-fallback pattern.
+    pub fn add_json_only(&self, pattern: &str) {
+        let mut v = self.json_only.lock().unwrap_or_else(|p| p.into_inner());
+        v.retain(|p| p != pattern);
+        v.push(pattern.to_string());
+    }
+
+    /// Does `path` match a registered pattern, such that a miss must be a JSON 404
+    /// rather than the SPA shell?
+    pub fn json_only_match(&self, path: &str) -> bool {
+        let v = self.json_only.lock().unwrap_or_else(|p| p.into_inner());
+        v.iter().any(|p| pattern_match(p, path))
     }
 
     /// Register (or replace) a raw route under `prefix`.
