@@ -123,11 +123,27 @@ pub fn wasm_urls(state: &State) -> Vec<String> {
     vec![js, wasm]
 }
 
-/// Is `web/pkg/*` older than any wasm-side source? Catches edits made while the
-/// server was down — most often during its own restart.
+/// Is the built artefact older than any wasm-side source? Catches edits made while
+/// the server was down — most often during its own restart.
+///
+/// Two corrections to the original, both earned by a production boot:
+///
+/// 1. The artefact was looked up as `root + "/pkg/…"`, but `/pkg/…` is a **URL**,
+///    not a path — the file lives in the app's pkg dir (first static root + `pkg`,
+///    i.e. `web/pkg/…`). The lookup therefore always failed, `built` was always
+///    `None`, and every process start declared the wasm stale.
+/// 2. `(None, _) => true` fired even with **no sources at all**. A production image
+///    deliberately ships `web/pkg` and no `app/` tree, so it rebuilt at startup
+///    into a toolchain it does not have: `build wasm #1 ← startup` … `FAILED in
+///    0 ms` on every boot. Nothing can be out of date if there is nothing to
+///    compare against, so a source-less tree is now never stale.
 pub fn wasm_is_stale(state: &State) -> bool {
+    if no_build() {
+        return false;
+    }
     let (js, _) = state.config.pkg_urls();
-    let built = std::fs::metadata(state.config.root.join(js.trim_start_matches('/')))
+    let file = Path::new(&js).file_name().map(PathBuf::from).unwrap_or_default();
+    let built = std::fs::metadata(state.config.pkg_dir().join(file))
         .ok()
         .and_then(|m| m.modified().ok());
     let newest = state
@@ -138,8 +154,22 @@ pub fn wasm_is_stale(state: &State) -> bool {
         .max();
     match (built, newest) {
         (Some(b), Some(n)) => n > b,
-        (None, _) => true,
+        // Sources but no artefact: a genuine first build.
+        (None, Some(_)) => true,
+        // Nothing to compare against: a prebuilt image, or a tree with no wasm crate.
         (_, None) => false,
+    }
+}
+
+/// `RUSTEX1_NO_BUILD=1` — serve what is on disk and never shell out to cargo.
+///
+/// For a container that ships the built `web/pkg` and no toolchain. It also gates an
+/// explicit `--rebuild`, because in such an image a forced build is a guaranteed
+/// failed build line rather than an instruction anyone can satisfy.
+pub fn no_build() -> bool {
+    match std::env::var("RUSTEX1_NO_BUILD") {
+        Ok(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
     }
 }
 
@@ -178,7 +208,23 @@ fn newest_source(dir: &Path, exts: &[&str]) -> Option<std::time::SystemTime> {
 }
 
 /// Rebuild the Rust → wasm frontend and hot-swap it in every connected browser.
+///
+/// `RUSTEX1_NO_BUILD` short-circuits here as well as at the startup decision, so a
+/// file-watch event or a stray `POST /api/rebuild` in a source-less image reports a
+/// refusal instead of inventing a build that cannot run.
 pub fn rebuild_wasm(state: &State, trigger: &[String]) -> Outcome {
+    if no_build() {
+        log(
+            "build",
+            &format!("wasm ← {} refused: RUSTEX1_NO_BUILD is set", trigger.join(", ")),
+        );
+        return Outcome {
+            ok: false,
+            ms: 0,
+            error: Some("RUSTEX1_NO_BUILD is set; this image serves web/pkg as shipped".into()),
+            changed: Vec::new(),
+        };
+    }
     let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let started = Instant::now();
     let seq = state.next_seq();
@@ -339,9 +385,6 @@ pub fn restart(state: &State) {
             return;
         }
     };
-    // Cargo replaces the running inode; Linux appends this marker to its path.
-    let exe = exe.to_string_lossy().strip_suffix(" (deleted)")
-        .map(std::path::PathBuf::from).unwrap_or(exe);
     state.broadcast(serde_json::json!({ "type": "restart", "target": "server" }));
     log("server", &format!("restarting → {}", exe.display()));
     std::thread::sleep(std::time::Duration::from_millis(150));

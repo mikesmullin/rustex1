@@ -117,6 +117,7 @@ pub struct Server {
     api: HashMap<String, ApiHandler>,
     raw: HashMap<String, RawHandler>,
     ws: HashMap<String, Ws>,
+    json_only: Vec<String>,
     on_start: Option<Box<dyn FnOnce(Arc<State>) + Send + 'static>>,
     force_rebuild: bool,
 }
@@ -128,6 +129,7 @@ impl Server {
             api: HashMap::new(),
             raw: HashMap::new(),
             ws: HashMap::new(),
+            json_only: Vec::new(),
             on_start: None,
             force_rebuild: false,
         }
@@ -179,6 +181,37 @@ impl Server {
             prefix.to_string(),
             Box::new(move |s, r, o| handler(s, r, o)),
         );
+        self
+    }
+
+    /// Declare a path pattern that must answer JSON even when nothing serves it.
+    ///
+    /// Unmatched requests fall through to the static handler, which serves
+    /// `index.html` for extensionless paths so the client-side Router works. That is
+    /// correct for a browser and harmful for a machine: a typo'd path under an
+    /// app-owned namespace returns `200 OK` + HTML, which a health checker reads as
+    /// "up" and an SDK reads as a JSON parse error.
+    ///
+    /// The framework cannot know these namespaces — a gateway registers one `raw`
+    /// prefix per profile in the app's own config, so an unknown profile matches
+    /// nothing at all. Registering the pattern makes the miss a JSON 404 instead.
+    /// `/api/*` is seeded by default; this adds to it.
+    ///
+    /// `*` matches one path segment, or one-or-more in trailing position:
+    ///
+    /// ```ignore
+    /// server = server
+    ///     .json_only("/*/v1")      // GET /no-such-preset/v1
+    ///     .json_only("/*/v1/*")    // GET /no-such-preset/v1/chat/completions
+    ///     .json_only("/*/health"); // GET /no-such-preset/health
+    /// ```
+    ///
+    /// Patterns only ever reject — a path that matches one of these AND has a
+    /// registered `raw` prefix is served by that prefix as normal, because raw
+    /// dispatch happens first. So there is no way for a pattern here to shadow a
+    /// working route.
+    pub fn json_only(mut self, pattern: &str) -> Self {
+        self.json_only.push(pattern.to_string());
         self
     }
 
@@ -239,6 +272,12 @@ impl Server {
         for prefix in self.raw.keys() {
             log("raw", &format!("{prefix}* · streaming"));
         }
+        // Logged alongside the routes it protects, because a pattern that silently
+        // fails to register is indistinguishable from one that was never added — and
+        // the symptom of that is a 200 + HTML page for a path meant to 404.
+        for pattern in &self.json_only {
+            log("json", &format!("{pattern} · never the SPA shell"));
+        }
         // One move out of `self`: taking `ws` earlier and destructuring the rest
         // afterwards would be a partial move the borrow checker rightly rejects.
         let Server {
@@ -246,6 +285,7 @@ impl Server {
             api,
             raw,
             ws,
+            json_only,
             on_start,
             force_rebuild,
         } = self;
@@ -277,6 +317,12 @@ impl Server {
         for (prefix, handler) in raw {
             state.add_raw(&prefix, handler);
         }
+        // Installed after `raw` purely for readability — the two lists are consulted
+        // in dispatch order (raw first, then this), so registration order cannot make
+        // a pattern reject a path its own raw handler serves.
+        for pattern in &json_only {
+            state.add_json_only(pattern);
+        }
         log(
             "boot",
             &format!(
@@ -294,7 +340,9 @@ impl Server {
         }
 
         // 1 · the frontend must exist before the browser asks for it.
-        if force_rebuild || build::wasm_is_stale(&state) {
+        if build::no_build() {
+            log("build", "RUSTEX1_NO_BUILD set — serving web/pkg as shipped, never building");
+        } else if force_rebuild || build::wasm_is_stale(&state) {
             build::rebuild_wasm(&state, &["startup".to_string()]);
         } else {
             log("build", "reusing web/pkg/* (pass --rebuild to force)");
