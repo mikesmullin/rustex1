@@ -385,6 +385,14 @@ pub fn restart(state: &State) {
             return;
         }
     };
+    // Linux reports an unlinked executable as `<path> (deleted)` after
+    // cargo replaces it. Restart the new binary at the original path.
+    let exe = if !exe.exists() {
+        exe.to_str().and_then(|path| path.strip_suffix(" (deleted)"))
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.exists())
+            .unwrap_or(exe)
+    } else { exe };
     state.broadcast(serde_json::json!({ "type": "restart", "target": "server" }));
     log("server", &format!("restarting → {}", exe.display()));
     std::thread::sleep(std::time::Duration::from_millis(150));
