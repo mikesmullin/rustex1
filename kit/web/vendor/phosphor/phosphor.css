@@ -4,6 +4,7 @@
     url("./Phosphor.woff2") format("woff2"),
     url("./Phosphor.woff") format("woff"),
     url("./Phosphor.ttf") format("truetype"),
+    url("./Phosphor.svg#Phosphor") format("svg");
   font-weight: normal;
   font-style: normal;
   font-display: block;

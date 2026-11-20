@@ -82,6 +82,9 @@ pub trait App {
         None
     }
 
+    /// Whether this app displays the kit's dev-server telemetry.
+    fn kit_dev_telemetry(&self) -> bool { true }
+
     /// Spawn loops (frame drivers, polling, housekeeping) — always through
     /// [`Runtime::every`] / [`Runtime::on_frame`] so a superseded instance stops.
     fn started(&self, _rt: &mut Runtime) {}
@@ -201,8 +204,10 @@ pub fn boot(
     mjs::mount("#app");
 
     // 6 · side effects: dev-server telemetry, then the app's own loops.
-    api::spawn_all();
-    live::spawn();
+    if app.kit_dev_telemetry() {
+        api::spawn_all();
+        live::spawn();
+    }
     app.started(&mut rt);
 
     if let Some((text, tone)) = app.boot_toast() {

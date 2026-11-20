@@ -15,7 +15,6 @@ use crate::mjs;
 
 pub fn spawn() {
     telemetry();
-    prune_loop();
 }
 
 /// 5 Hz: `window.__HMR__` (written by the JS hot client) → the `session` store,
@@ -68,14 +67,5 @@ fn telemetry() {
         if !error.is_empty() {
             js::set_str(&s, "error", &error);
         }
-    });
-}
-
-/// 1 Hz housekeeping: expire toasts so a page left open during a long edit
-/// session does not accumulate them.
-pub fn prune_loop() {
-    lifecycle::every(1000.0, || {
-        let toasts = mjs::store_ref("toasts");
-        js::call(&toasts, "prune", &[]);
     });
 }

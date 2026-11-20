@@ -95,6 +95,7 @@ fn toasts() {
             }
             // Replace (not mutate) so m-js sees a new value and schedules a draw.
             js::set(&this, "items", &next.into());
+            schedule_toast_expiry(js::get_num(&this, "ttl"));
             JsValue::UNDEFINED
         })
         .method("dismiss", |this, args| {
@@ -136,6 +137,30 @@ fn toasts() {
             JsValue::UNDEFINED
         });
     mjs::store("toasts", &d.finish());
+    // On hot reload existing toasts survive; arrange their expiry as well.
+    let store = mjs::store_ref("toasts");
+    let items = js::get(&store, "items");
+    if let Some(list) = items.dyn_ref::<Array>() {
+        if list.length() > 0 { schedule_toast_expiry(0.0); }
+    }
+}
+
+fn schedule_toast_expiry(delay: f64) {
+    crate::lifecycle::after(delay.max(0.0) + 1.0, || {
+        let store = mjs::store_ref("toasts");
+        js::call(&store, "prune", &[]);
+        let items = js::get(&store, "items");
+        if let Some(list) = items.dyn_ref::<Array>() {
+            if list.length() > 0 {
+                let ttl = js::get_num(&store, "ttl");
+                let mut remaining = ttl;
+                for item in list.iter() {
+                    remaining = remaining.min(js::get_num(&item, "at") + ttl - now_ms());
+                }
+                schedule_toast_expiry(remaining);
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
